@@ -1,0 +1,264 @@
+library(readxl)       # for reading .xlsx/.xlsm Excel files
+library(dplyr)         # for data wrangling (filter, mutate, arrange, etc.)
+library(tidyr)          # for data reshaping (used indirectly via dplyr pipeline compatibility)
+library(ggplot2)        # for building the plot
+library(ggrepel)        # for non-overlapping text labels on the plot (peak annotations)
+library(stringr)        # for str_wrap(), used to wrap the long subtitle text
+
+# Path to the TargetScan predicted-targets Excel file (contains one sheet per miRNA arm)
+targetscan_path <- "~/Downloads/TargetScan8.0__miR-142-3p.1.Mouse.predicted_targets (1).xlsx"
+# Path to the DEG (differential expression) Excel file
+deg_path  <- "~/Downloads/mir142_ko_vs_wt.xlsm"
+# Name of the sheet inside deg_path that holds the actual DEG table
+deg_sheet <- "mir142_ko_vs_wt"
+
+# Named vector mapping a short label (used in plots/legends) to the actual sheet name
+# in the TargetScan file for each of the three miR-142 mature-strand variants
+target_sheets <- c(
+  "3p.1" = "3p.1_TargetScanMouse_8.0",
+  "3p.2" = "3p.2_TargetScanMouse_8.0",
+  "5p"   = "5p_TargetScanMouse_8.0"
+)
+
+# Function that builds the "target gene" sets (one per miRNA arm) for a given
+# site-strength tier ("6mer", "7mer", or "8mer")
+build_target_sets <- function(tier) {
+  # Loop over each arm's sheet name in target_sheets
+  lapply(target_sheets, function(sheet) {
+    # Read that arm's TargetScan sheet into a data frame
+    df <- read_excel(targetscan_path, sheet = sheet)
+    # Depending on which tier was requested, compute a site_count column:
+    site_count <- switch(tier,
+                         # 6mer tier: just use the "6mer sites" column directly
+                         "6mer" = df[["6mer sites"]],
+                         # 7mer tier: sum all four 7mer-related site-count columns (row-wise),
+                         # treating any missing values as 0
+                         "7mer" = rowSums(df[, c("Conserved 7mer-m8 sites", "Conserved 7mer-A1 sites",
+                                                 "Poorly conserved 7mer-m8 sites", "Poorly conserved 7mer-A1 sites")],
+                                          na.rm = TRUE),
+                         # 8mer tier: sum the two 8mer-related site-count columns (row-wise)
+                         "8mer" = rowSums(df[, c("Conserved 8mer sites", "Poorly conserved 8mer sites")],
+                                          na.rm = TRUE)
+    )
+    # Keep only rows where site_count is not missing AND at least 1
+    # (i.e., genes that actually have at least one predicted site of this tier)
+    df <- df[!is.na(site_count) & site_count >= 1, ]
+    # Return the unique, uppercased, whitespace-trimmed gene symbols for this arm/tier
+    unique(toupper(trimws(df[["Target gene"]])))
+  })
+}
+
+# Read the DEG sheet and build the ranked gene list
+deg <- read_excel(deg_path, sheet = deg_sheet) %>%
+  # Force pvalue and padj columns to be numeric, suppressing warnings from any
+  # non-numeric entries that get coerced to NA
+  mutate(pvalue = suppressWarnings(as.numeric(pvalue)),
+         padj   = suppressWarnings(as.numeric(padj))) %>%
+  # Drop any row missing a gene name or missing the ranking statistic ("stat")
+  filter(!is.na(external_gene_name), !is.na(stat)) %>%
+  # Remove duplicate gene symbols, keeping the first occurrence of each
+  distinct(external_gene_name, .keep_all = TRUE) %>%
+  # Standardize gene symbols to uppercase and strip leading/trailing whitespace,
+  # so they match the TargetScan gene symbols later
+  mutate(external_gene_name = toupper(trimws(external_gene_name))) %>%
+  # Sort genes from highest to lowest "stat" (most confidently up-in-KO first)
+  arrange(desc(stat))
+
+# Extract just the ranked gene-symbol vector, in order, from the deg data frame
+ranked_genes <- deg$external_gene_name
+# Total number of genes in the ranked list
+N_total <- length(ranked_genes)
+# How many genes to step forward by each time we compute an enrichment point
+# along the ranked list (i.e., resolution of the x-axis)
+step <- 50
+
+# Function that computes the enrichment "landscape" (a curve of signed -log10(p)
+# values) for a given ranked gene list and a given target gene set
+compute_landscape <- function(ranked_genes, target_set, step) {
+  # Total number of genes in the ranked list
+  N <- length(ranked_genes)
+  # Number of genes in the ranked list that are also in the target set
+  # (this is the total "successes" available to draw from, in hypergeometric terms)
+  m <- sum(ranked_genes %in% target_set)
+  # Number of genes in the ranked list that are NOT in the target set
+  # (the total "failures" available to draw from)
+  n <- N - m
+  # Generate a sequence of rank cutoffs (k) to evaluate: step, 2*step, 3*step, ... up to N
+  ks <- seq(step, N, by = step)
+  # Make sure the very last gene (rank = N) is included as a cutoff, even if it
+  # doesn't fall exactly on a step boundary
+  if (ks[length(ks)] != N) ks <- c(ks, N)
+  
+  # For each cutoff k, compute the enrichment statistic
+  res <- lapply(ks, function(k) {
+    # Take the top k genes from the ranked list (the "window" being tested)
+    top_k <- ranked_genes[1:k]
+    # Count how many of those top k genes are in the target set (observed successes)
+    x <- sum(top_k %in% target_set)
+    
+    # Hypergeometric p-value for enrichment: probability of seeing x or MORE
+    # target genes in a random draw of k genes from the full pool (m successes, n failures)
+    p_enrich <- phyper(x - 1, m, n, k, lower.tail = FALSE)
+    # Hypergeometric p-value for depletion: probability of seeing x or FEWER
+    # target genes in the same random draw
+    p_deplete <- phyper(x, m, n, k, lower.tail = TRUE)
+    
+    # The number of target genes you'd expect in the top k by pure chance
+    expected <- k * m / N
+    # If we observed at least as many target genes as expected, report a positive
+    # score (enrichment); otherwise report a negative score (depletion).
+    # Using log10 of the p-value gives a symmetric signed statistic around 0.
+    signed_log10p <- if (x >= expected) -log10(p_enrich) else log10(p_deplete)
+    
+    # Return one row of results for this rank cutoff
+    data.frame(rank = k, x = x, expected = expected, signed_log10p = signed_log10p)
+  })
+  
+  # Combine all the per-cutoff rows into a single data frame
+  bind_rows(res)
+}
+
+# Fix the random number seed so the random gene-set sampling is reproducible
+set.seed(1)
+# Number of random gene sets to draw (per target-set size) for the empirical null.
+# 500 gives a much more stable estimate of the null distribution's tails than a
+# small number would -- especially important since the envelope and emp_p below
+# both depend on the shape of this distribution, not just its rough spread.
+n_random <- 500
+
+# Function that builds the full Sylamer-style plot for a given site-strength tier
+make_sylamer_plot <- function(tier) {
+  # Build the three (one per arm) target gene sets for this tier
+  target_sets <- build_target_sets(tier)
+  # For each arm, compute its enrichment landscape and tag the rows with the arm's name
+  landscape_list <- lapply(names(target_sets), function(nm) {
+    df <- compute_landscape(ranked_genes, target_sets[[nm]], step)
+    df$mir_arm <- nm
+    df
+  })
+  # Combine the three arms' landscape data frames into one
+  landscape <- bind_rows(landscape_list)
+  
+  # Get the distinct target-set sizes actually used (may be fewer than 3 if arms share a size)
+  random_sizes <- unique(sapply(target_sets, length))
+  # Empty list to collect random-draw landscape results
+  random_landscape_list <- list()
+  # For each distinct target-set size...
+  for (sz in random_sizes) {
+    # ...draw n_random random gene sets of that size and compute their landscapes
+    for (i in seq_len(n_random)) {
+      # Randomly sample sz genes from the full ranked list, with no regard to target status
+      rand_set <- sample(ranked_genes, size = sz)
+      # Compute the enrichment landscape as if this random set were a "target set"
+      df <- compute_landscape(ranked_genes, rand_set, step)
+      # Record the target-set size this draw corresponds to, so it can be matched
+      # back up to the real arm(s) of that same size later
+      df$size <- sz
+      # Tag this draw with a unique identifier (size + draw number)
+      df$draw <- paste0("rand_", sz, "_", i)
+      # Append this draw's results to the running list
+      random_landscape_list[[length(random_landscape_list) + 1]] <- df
+    }
+  }
+  # Combine all random draws into a single data frame (used for the empirical null)
+  random_landscape <- bind_rows(random_landscape_list)
+  
+  # For each target-set size and each rank, compute the 0.5th and 99.5th percentile
+  # of the random draws' signed_log10p values. This is the empirical 99% envelope --
+  # what enrichment "by chance alone" actually looks like at that point in the ranking,
+  # as opposed to a single fixed p=0.05 line that ignores how the null's spread
+  # changes with rank and with target-set size.
+  envelope <- random_landscape %>%
+    group_by(size, rank) %>%
+    summarise(lo = quantile(signed_log10p, 0.005),
+              hi = quantile(signed_log10p, 0.995),
+              .groups = "drop")
+  
+  # Look up each arm's target-set size, so the envelope (which is keyed by size)
+  # can be attached to the right arm's curve
+  size_by_arm <- sapply(target_sets, length)
+  # Tag each row of the real landscape with its arm's target-set size
+  landscape$size <- size_by_arm[landscape$mir_arm]
+  # Duplicate the size-matched envelope for each arm, so it can be drawn once per arm
+  envelope_list <- lapply(names(target_sets), function(nm) {
+    e <- envelope[envelope$size == size_by_arm[nm], ]
+    e$mir_arm <- nm
+    e
+  })
+  # Combine the per-arm envelope pieces into one data frame for plotting
+  envelope <- bind_rows(envelope_list)
+  
+  # For each random draw, find its own single most extreme point (max absolute
+  # signed_log10p) anywhere along its curve. This captures "how extreme does a
+  # random curve get, at its most extreme point, if you're allowed to look
+  # anywhere along the whole ranked list" -- which is the same thing being done
+  # to the real data below, so it's a fair comparison.
+  global_max <- random_landscape %>%
+    group_by(size, draw) %>%
+    summarise(max_abs = max(abs(signed_log10p)), .groups = "drop")
+  
+  # For each arm, find the single rank at which its real enrichment signal is most
+  # extreme (largest absolute signed_log10p), then compute an empirical p-value:
+  # the fraction of random draws (of matching target-set size) whose own peak was
+  # at least as extreme as this real peak. This replaces a fixed hypergeometric
+  # p-value threshold with something that accounts for having scanned many
+  # overlapping ranks along the curve.
+  peaks <- landscape %>%
+    group_by(mir_arm) %>%                                  # process each arm separately
+    filter(abs(signed_log10p) == max(abs(signed_log10p))) %>%  # keep the row(s) at the most extreme point
+    slice(1) %>%                                            # if there's a tie, just take the first one
+    ungroup() %>%
+    rowwise() %>%
+    mutate(
+      # Compare this arm's peak against the pool of random draws with the same target-set size
+      emp_p = mean(global_max$max_abs[global_max$size == size] >= abs(signed_log10p))
+    ) %>%
+    ungroup()
+  
+  # Build the plot
+  ggplot() +
+    # Horizontal line at y=0 (baseline: no enrichment or depletion)
+    geom_hline(yintercept = 0, color = "black", linewidth = 0.3) +
+    # Grey ribbon: the empirical 99% envelope from the random draws, drawn per arm
+    # (size-matched), replacing the old fixed dotted significance lines
+    geom_ribbon(data = envelope, aes(x = rank, ymin = lo, ymax = hi, group = mir_arm),
+                fill = "grey70", alpha = 0.3) +
+    # Colored foreground lines: one per real miRNA arm's actual enrichment curve
+    geom_line(data = landscape, aes(x = rank, y = signed_log10p, color = mir_arm), linewidth = 1.1) +
+    # Vertical dashed line at each arm's peak rank, colored to match that arm
+    geom_vline(data = peaks, aes(xintercept = rank, color = mir_arm), linetype = "dashed", linewidth = 0.4, show.legend = FALSE) +
+    # Text label at each arm's peak, showing "rank (number of target genes) genes, emp p=...",
+    # positioned with repelling logic so labels don't overlap each other or the lines
+    geom_text_repel(data = peaks, aes(x = rank, y = signed_log10p,
+                                      label = paste0(rank, " (", x, " genes), emp p=", signif(emp_p, 2)),
+                                      color = mir_arm),
+                    size = 3.2, show.legend = FALSE, seed = 1, fontface = "bold", min.segment.length = 0, segment.size = 0.4,
+                    box.padding = 1, point.padding = 0.4, force = 8, force_pull = 0.5, nudge_y = 1.5, direction = "both",
+                    max.overlaps = Inf, bg.color = "white", bg.r = 0.15) +
+    # Manually assign specific colors to each arm, and suppress the legend title
+    scale_color_manual(values = c("3p.1" = "#D55E00", "3p.2" = "#0072B2", "5p" = "#009E73"), name = NULL) +
+    # Add small padding to the left/right edges of the x-axis so lines/labels aren't clipped
+    scale_x_continuous(expand = expansion(mult = c(0.02, 0.06))) +
+    # Title, subtitle (wrapped to 80 characters, explaining the envelope and emp p),
+    # and axis labels
+    labs(title = paste0("Sylamer-style enrichment landscape: miR-142 ", tier, " targets"),
+         subtitle = str_wrap(paste0("Genes sorted from upregulated to downregulated (KO vs WT); grey band = 99% envelope from ", n_random, " random gene sets per target-set size; emp p = fraction of random draws whose peak matches or exceeds the observed peak"), width = 80),
+         x = "Genes sorted from upregulated to downregulated", y = expression("log"[10]*"(enrichment P-value)")) +
+    # Use a clean minimal theme as the base, with a specified base font size
+    theme_minimal(base_size = 13) +
+    # Fine-tune specific theme elements: bold title, grey subtitle, no minor gridlines,
+    # no vertical major gridlines, legend on top, legend text size, and plot margins
+    theme(plot.title = element_text(face = "bold"), plot.subtitle = element_text(color = "grey30"),
+          panel.grid.minor = element_blank(), panel.grid.major.x = element_blank(),
+          legend.position = "top", legend.text = element_text(size = 11), plot.margin = margin(10, 14, 10, 10))
+}
+
+# Generate the plot for each of the three site-strength tiers
+p_6mer <- make_sylamer_plot("6mer")
+p_7mer <- make_sylamer_plot("7mer")
+p_8mer <- make_sylamer_plot("8mer")
+
+# Save each plot to a PNG file at 9.5x6.5 inches, 300 dpi resolution
+ggsave("sylamer_style_miR142_6mer.png", p_6mer, width = 9.5, height = 6.5, dpi = 300)
+ggsave("sylamer_style_miR142_7mer.png", p_7mer, width = 9.5, height = 6.5, dpi = 300)
+ggsave("sylamer_style_miR142_8mer.png", p_8mer, width = 9.5, height = 6.5, dpi = 300)
